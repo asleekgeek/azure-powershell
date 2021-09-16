@@ -8,11 +8,20 @@ Param(
     [Parameter(ParameterSetName='ReleaseAz', Mandatory = $true)]
     [string]$Release,
 
+    [Parameter(ParameterSetName='ReleaseAzByMonthAndYear', Mandatory = $true)]
+    [string]$MonthName,
+
+    [Parameter(ParameterSetName='ReleaseAzByMonthAndYear', Mandatory = $true)]
+    [string]$Year,
+
     [Parameter(ParameterSetName='ReleaseSingleModule', Mandatory = $true)]
     [string]$ModuleName,
 
     [Parameter()]
-    [string]$GalleryName = "PSGallery"
+    [string]$GalleryName = "PSGallery",
+
+    [Parameter()]
+    [switch]$SkipAzInstall
 )
 
 enum PSVersion
@@ -93,9 +102,9 @@ function Update-AzurecmdFile
         [string]$RootPath
     )
 
-    $AzurecmdFile = Get-Item -Path "$RootPath\setup\azurecmd.wxs"
+    $AzurecmdFile = Get-Item -Path "$RootPath\setup\generate.ps1"
     (Get-Content $AzurecmdFile.FullName) | % {
-        $_ -replace "Microsoft Azure PowerShell - (\w*)(\s)(\w*)", "Microsoft Azure PowerShell - $Release"
+        $_ -replace "Microsoft Azure PowerShell - (\w*)(\s)(\d*)", "Microsoft Azure PowerShell - $Release"
     } | Set-Content -Path $AzurecmdFile.FullName -Encoding UTF8
 
     (Get-Content $AzurecmdFile.FullName) | % {
@@ -130,12 +139,18 @@ function Get-ReleaseNotes
     )
 
     $ProjectPaths = @( "$RootPath\src" )
+    
+    .($PSScriptRoot + "\PreloadToolDll.ps1")
     $ModuleManifestFile = $ProjectPaths | % { Get-ChildItem -Path $_ -Filter "*.psd1" -Recurse | where { $_.Name.Replace(".psd1", "") -eq $Module -and `
                                                                                                           $_.FullName -notlike "*Debug*" -and `
                                                                                                           $_.FullName -notlike "*Netcore*" -and `
                                                                                                           $_.FullName -notlike "*dll-Help.psd1*" -and `
-                                                                                                          $_.FullName -notlike "*Stack*" } }
-
+                                                                                                          (-not [Tools.Common.Utilities.ModuleFilter]::IsAzureStackModule($_.FullName)) } }
+    
+    if($ModuleManifestFile.Count -gt 1)
+    {
+        $ModuleManifestFile = $ModuleManifestFile[0]
+    }                                                                                                      
     Import-LocalizedData -BindingVariable ModuleMetadata -BaseDirectory $ModuleManifestFile.DirectoryName -FileName $ModuleManifestFile.Name
     return $ModuleMetadata.PrivateData.PSData.ReleaseNotes
 }
@@ -152,6 +167,19 @@ function Update-ChangeLog
     $ChangeLogFile = Get-Item -Path "$RootPath\ChangeLog.md"
     $ChangeLogContent = Get-Content -Path $ChangeLogFile.FullName
     ($Content + $ChangeLogContent) | Set-Content -Path $ChangeLogFile.FullName -Encoding UTF8
+}
+
+function Update-Image-Releases
+{
+    Param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReleaseProps,
+        [Parameter(Mandatory = $true)]
+        [string]$AzVersion
+    )
+
+    $content = Get-Content $ReleaseProps
+    $content -Replace "az.version=\d+\.\d+\.\d+", "az.version=$AzVersion" | Set-Content $ReleaseProps
 }
 
 function Get-ExistSerializedCmdletJsonFile
@@ -260,14 +288,20 @@ function Generate-AzPreview
             $Psd1Object = Import-PowerShellDataFile $Psd1FilePath
             $moduleName = "Az.${ModuleName}"
             $moduleVersion = $Psd1Object.ModuleVersion.ToString()
-            $requiredModulesString += "@{ModuleName = '$moduleName'; RequiredVersion = '$moduleVersion'; }, 
-            "
+            if('Az.Accounts' -eq $moduleName)
+            {
+                $requiredModulesString += "@{ModuleName = '$moduleName'; ModuleVersion = '$moduleVersion'; }, `n            "
+            }
+            else
+            {
+                $requiredModulesString += "@{ModuleName = '$moduleName'; RequiredVersion = '$moduleVersion'; }, `n            "
+            }            
         }
     }
     $requiredModulesString = $requiredModulesString.Trim()
     $requiredModulesString = $requiredModulesString.TrimEnd(",")
 
-    $AzPrviewTemplate = Get-Item -Path "$PSScriptRoot\AzPreview\AzPreview.psd1.template"
+    $AzPrviewTemplate = Get-Item -Path "$PSScriptRoot\AzPreview.psd1.template"
     $AzPrviewTemplateContent = Get-Content -Path $AzPrviewTemplate.FullName
     $AzPreviewPsd1Content = $AzPrviewTemplateContent | % {
         $_ -replace "ModuleVersion = 'x.x.x'", "ModuleVersion = '$AzPrviewVersion'"
@@ -283,16 +317,21 @@ switch ($PSCmdlet.ParameterSetName)
 {
     "ReleaseSingleModule"
     {
+        Write-Host executing dotnet $PSScriptRoot/../artifacts/VersionController/VersionController.Netcore.dll $PSScriptRoot/../artifacts/VersionController/Exceptions $ModuleName
         dotnet $PSScriptRoot/../artifacts/VersionController/VersionController.Netcore.dll $PSScriptRoot/../artifacts/VersionController/Exceptions $ModuleName
     }
 
-    "ReleaseAz"
+    "ReleaseAzByMonthAndYear"
     {
-
+        $Release = "$MonthName $Year"
+    }
+    
+    {$PSItem.StartsWith("ReleaseAz")}
+    {        
         # clean the unnecessary SerializedCmdlets json file
         $ExistSerializedCmdletJsonFile = Get-ExistSerializedCmdletJsonFile
         $ExpectJsonHashSet = @{}
-        $SrcPath = "..\src"
+        $SrcPath = Join-Path -Path $PSScriptRoot -ChildPath "..\src"
         foreach ($ModuleName in $(Get-ChildItem $SrcPath -Directory).Name)
         {
             $ModulePath = $(Join-Path -Path $SrcPath -ChildPath $ModuleName)
@@ -303,36 +342,38 @@ switch ($PSCmdlet.ParameterSetName)
                 $Psd1Object = Import-PowerShellDataFile $Psd1FilePath
                 if ($Psd1Object.ModuleVersion -ge "1.0.0")
                 {
-                    foreach ($NestedModule in $Psd1Object.NestedModules)
-                    {
-                        $JsonFile = $NestedModule.Replace(".\", "") + ".json"
-                        $ExpectJsonHashSet.Add($JsonFile, $true)
-                    }
+                    $ExpectJsonHashSet.Add("Az.${ModuleName}.json", $true)
                 }
             }
         }
         foreach ($JsonFile in $ExistSerializedCmdletJsonFile)
         {
-            $ModuleName = $JsonFile.Replace('Microsoft.Azure.PowerShell.Cmdlets.', '').Replace('.dll.json', '')
+            $ModuleName = $JsonFile.Replace('.json', '')
             if (!$ExpectJsonHashSet.Contains($JsonFile))
             {
-                Write-Host "Module ${ModuleName} is not GA yet. Remove the json file: ${JsonFile}." -ForegroundColor Red
-                rm $(Join-Path -Path "$PSScriptRoot\Tools.Common\SerializedCmdlets" -ChildPath $JsonFile)
+                Write-Host "Module ${ModuleName} is not GA yet. The json file: ${JsonFile} is for reference"
             }
         }
         try
         {
-            Install-Module Az -Repository $GalleryName -Force -AllowClobber
+            if(!$SkipAzInstall.IsPresent)
+            {
+                Install-Module Az -Repository $GalleryName -Force -AllowClobber
+            }
         }
         catch
         {
             throw "Please rerun in Administrator mode."
         }
 
+        Write-Host executing dotnet $PSScriptRoot/../artifacts/VersionController/VersionController.Netcore.dll
         dotnet $PSScriptRoot/../artifacts/VersionController/VersionController.Netcore.dll
 
         Bump-AzVersion
 
         Generate-AzPreview
+
+        # Generate dotnet csv
+        &$PSScriptRoot/Docs/GenerateDotNetCsv.ps1 -FeedPsd1FullPath "$PSScriptRoot\AzPreview\AzPreview.psd1" -CustomSource "https://www.poshtestgallery.com/api/v2/"
     }
 }

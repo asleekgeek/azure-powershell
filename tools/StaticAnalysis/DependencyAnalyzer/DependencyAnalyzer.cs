@@ -183,7 +183,7 @@ namespace StaticAnalysis.DependencyAnalyzer
             "System.Security.Principal.Windows",
             "System.Data.SqlClient",
             "System.Security.Cryptography.ProtectedData",
-            "System.Text.Json"
+            "System.Text.Json" //TODO: Compare Version along with Azure.Core
         };
 
         private readonly Dictionary<string, AssemblyRecord> _assemblies =
@@ -228,6 +228,7 @@ namespace StaticAnalysis.DependencyAnalyzer
             _dependencyMapLogger = Logger.CreateLogger<DependencyMap>("DependencyMap.csv");
             foreach (var baseDirectory in directories)
             {
+                SharedAssemblyLoader.Load(baseDirectory);
                 foreach (var directoryPath in Directory.EnumerateDirectories(baseDirectory))
                 {
                     if (modulesToAnalyze != null &&
@@ -293,6 +294,9 @@ namespace StaticAnalysis.DependencyAnalyzer
             {
                 var stored = _sharedAssemblyReferences[assembly.AssemblyName];
                 if (assembly.Equals(stored) || IsFrameworkAssembly(assembly.AssemblyName) && assembly.Version.Major <= 4) return true;
+                //TODO: Compare Azure.Core version
+                if (string.Equals(assembly.AssemblyName.Name, "Azure.Core", StringComparison.InvariantCultureIgnoreCase))
+                    return true;
 
                 _sharedConflictLogger.LogRecord(new SharedAssemblyConflict
                 {
